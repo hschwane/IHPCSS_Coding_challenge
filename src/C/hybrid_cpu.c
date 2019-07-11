@@ -11,7 +11,7 @@
 #include <math.h> // fabs
 #include <mpi.h> // MPI_*
 #include <string.h> // strcmp
-#include "util.h"  
+#include "util.h"
 
 /**
  * @brief Runs the experiment.
@@ -23,7 +23,7 @@ int main(int argc, char *argv[])
 	// Temperature grid.
 	double temperature[ROWS+2][COLUMNS+2];
 	// Temperature grid from last iteration
-	double temperature_last[ROWS+2][COLUMNS+2]; 
+	double temperature_last[ROWS+2][COLUMNS+2];
 	// Current iteration.
     int iteration = 0;
     // Temperature change for our MPI process
@@ -36,17 +36,17 @@ int main(int argc, char *argv[])
     int my_rank;
     // Status returned by MPI calls
     MPI_Status status[2];
-    
+
     // Request returned by MPI calls
-    MPI_Request request[2] = MPI_REQUEST_NULL;
+    MPI_Request request[4] = MPI_REQUEST_NULL;
 
     MPI_Datatype column;
     // The usual MPI startup routines
 	int provided;
-	MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+	MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
         MPI_Type_contiguous(COLUMNS, MPI_DOUBLE, &column);
         MPI_Type_commit(&column);
-	if(provided < MPI_THREAD_FUNNELED)
+	if(provided < MPI_THREAD_MULTIPLE)
     {
         printf("The threading support level is lesser than that demanded.\n");
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
@@ -73,6 +73,12 @@ int main(int argc, char *argv[])
     // Initialise temperatures and temperature_last including boundary conditions
     initialise_temperatures(temperature, temperature_last);
 
+    // nonblocking requests
+    MPI_Request top_recv = MPI_REQUEST_NULL;
+    MPI_Request top_send = MPI_REQUEST_NULL;
+    MPI_Request bottom_recv = MPI_REQUEST_NULL;
+    MPI_Request bottom_send = MPI_REQUEST_NULL;
+
     ///////////////////////////////////
     // -- Code from here is timed -- //
     ///////////////////////////////////
@@ -85,74 +91,107 @@ int main(int argc, char *argv[])
     {
         iteration++;
 
-        // Main calculation: average my four neighbours
-	#pragma omp parallel for
-        for(unsigned int i = 1; i <= ROWS; i++)
+        #pragma omp parallel
         {
-            for(unsigned int j = 1; j <= COLUMNS; j++)
+
+            #pragma omp single nowait
             {
-                temperature[i][j] = 0.25 * (temperature_last[i+1][j  ] +
-                                            temperature_last[i-1][j  ] +
-                                            temperature_last[i  ][j+1] +
-                                            temperature_last[i  ][j-1]);
+
+                // make sure ghost cells are done updating and then compute the upper line
+                MPI_Wait(&top_send, MPI_STATUS_IGNORE);
+                MPI_Wait(&top_recv, MPI_STATUS_IGNORE);
+                int i = 1;
+                for(unsigned int j = 1; j <= COLUMNS; j++)
+                {
+                    temperature[i][j] = 0.25 * (temperature_last[i + 1][j] +
+                                                temperature_last[i - 1][j] +
+                                                temperature_last[i][j + 1] +
+                                                temperature_last[i][j - 1]);
+                }
+
+                // make sure ghost cells are done updating and then compute the last line
+                MPI_Wait(&bottom_send, MPI_STATUS_IGNORE);
+                MPI_Wait(&bottom_recv, MPI_STATUS_IGNORE);
+                i = ROWS;
+                for(unsigned int j = 1; j <= COLUMNS; j++)
+                {
+                    temperature[i][j] = 0.25 * (temperature_last[i + 1][j] +
+                                                temperature_last[i - 1][j] +
+                                                temperature_last[i][j + 1] +
+                                                temperature_last[i][j - 1]);
+                }
+
+                // now start all non blocking comm
+
+                // If we are not the first MPI process, we have a top neighbour
+                if(my_rank != 0)
+                {
+                    // We receive the bottom row from that neighbour into our top halo
+                    MPI_Irecv(&temperature_last[0][1], 1, column, my_rank-1, 0, MPI_COMM_WORLD, &top_recv);
+                }
+
+                // If we are not the first MPI process, we have a top neighbour
+                if(my_rank != 0)
+                {
+                    // Send out top row to our top neighbour
+                    MPI_Isend(&temperature[1][1], 1, column, my_rank-1, 1, MPI_COMM_WORLD, &top_send);
+                }
+
+                // If we are not the last MPI process, we have a bottom neighbour
+                if(my_rank != comm_size-1)
+                {
+                    // We send our bottom row to our bottom neighbour
+                    MPI_Isend(&temperature[ROWS][1], 1, column, my_rank+1, 0, MPI_COMM_WORLD, &bottom_send);
+                }
+
+                // If we are not the last MPI process, we have a bottom neighbour
+                if(my_rank != comm_size-1)
+                {
+                    // We receive the top row from that neighbour into our bottom halo
+                    MPI_Irecv(&temperature_last[ROWS+1][1], 1, column, my_rank+1, 1, MPI_COMM_WORLD, &bottom_recv);
+                }
+
             }
-        }
 
-        //////////////////////
-        // HALO SWAP PHASE //
-        ////////////////////
-
-        // If we are not the last MPI process, we have a bottom neighbour
-        if(my_rank != comm_size-1)
-        {
-			// We send our bottom row to our bottom neighbour
-	    //MPI_Sendrecv(&temperature[ROWS][1], COLUMNS, MPI_DOUBLE, my_rank+1, 0, &temperature_last[0][1], COLUMNS, MPI_DOUBLE, my_rank, 0, MPI_COMM_WORLD, &status[0]);
-            MPI_Isend(&temperature[ROWS][1], 1, column, my_rank+1, my_rank, MPI_COMM_WORLD, &request[0]);
-        }
-
-        // If we are not the first MPI process, we have a top neighbour
-        if(my_rank != 0)
-        {
-            // We receive the bottom row from that neighbour into our top halo
-            MPI_Irecv(&temperature_last[0][1], 1, column, my_rank-1, my_rank-1, MPI_COMM_WORLD, &request[0]);
-        }
-
-        // If we are not the first MPI process, we have a top neighbour
-        if(my_rank != 0)
-        {
-            // Send out top row to our top neighbour
-            MPI_Isend(&temperature[1][1], 1, column, my_rank-1, my_rank, MPI_COMM_WORLD, &request[1]);
-            //MPI_Sendrecv(&temperature[1][1], COLUMNS, MPI_DOUBLE, my_rank-1, my_rank, &temperature_last[ROWS+1][1], COLUMNS, MPI_DOUBLE, my_rank, my_rank, MPI_COMM_WORLD, &status[0]);
-        }
-
-        // If we are not the last MPI process, we have a bottom neighbour
-        if(my_rank != comm_size-1)
-        {   
-            // We receive the top row from that neighbour into our bottom halo
-            MPI_Irecv(&temperature_last[ROWS+1][1], 1, column, my_rank+1, my_rank+1, MPI_COMM_WORLD, &request[1]);
-        }
-
-        MPI_Waitall(2, request, status);
-
-        //////////////////////////////////////
-        // FIND MAXIMAL TEMPERATURE CHANGE //
-        ////////////////////////////////////
-        dt = 0.0;
-
-	#pragma omp parallel for reduction(max:dt)
-        for(unsigned int i = 1; i <= ROWS; i++)
-        {
-            for(unsigned int j = 1; j <= COLUMNS; j++)
+            // Main calculation: average my four neighbours
+            #pragma omp for nowait
+            for(unsigned int i = 2; i <= ROWS-1; i++)
             {
-    	        dt = fmax(fabs(temperature[i][j]-temperature_last[i][j]), dt);
-    	        temperature_last[i][j] = temperature[i][j];
+                for(unsigned int j = 1; j <= COLUMNS; j++)
+                {
+                    temperature[i][j] = 0.25 * (temperature_last[i + 1][j] +
+                                                temperature_last[i - 1][j] +
+                                                temperature_last[i][j + 1] +
+                                                temperature_last[i][j - 1]);
+                }
             }
+
+
+            //////////////////////////////////////
+            // FIND MAXIMAL TEMPERATURE CHANGE //
+            ////////////////////////////////////
+            #pragma omp single nowait
+            dt = 0.0;
+
+            #pragma omp barrier // make sure all temperatures are updated
+
+            #pragma omp for reduction(max:dt)
+            for(unsigned int i = 1; i <= ROWS; i++)
+            {
+                for(unsigned int j = 1; j <= COLUMNS; j++)
+                {
+                    dt = fmax(fabs(temperature[i][j]-temperature_last[i][j]), dt);
+                    temperature_last[i][j] = temperature[i][j];
+                }
+            }
+
         }
 
         // We know our temperature delta, we now need to sum it with that of other MPI processes
         //MPI_Reduce(&dt, &dt_global, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         //MPI_Bcast(&dt_global, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
         MPI_Iallreduce(&dt, &dt_global, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD, &request[1]);
+
         // Periodically print test values
         if((iteration % PRINT_FREQUENCY) == 0)
         {
@@ -164,7 +203,7 @@ int main(int argc, char *argv[])
         MPI_Wait(&request[1], &status[1]);
     }
 
-    // Slightly more accurate timing and cleaner output 
+    // Slightly more accurate timing and cleaner output
     MPI_Barrier(MPI_COMM_WORLD);
 
     /////////////////////////////////////////////
@@ -176,7 +215,7 @@ int main(int argc, char *argv[])
         print_summary(iteration, dt_global, timer_simulation);
     }
 
-	// Print the halo swap verification cell value 
+	// Print the halo swap verification cell value
 	MPI_Barrier(MPI_COMM_WORLD);
 	if(my_rank == comm_size - 2)
 	{
