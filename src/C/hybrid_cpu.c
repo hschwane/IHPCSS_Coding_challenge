@@ -1,6 +1,6 @@
 /**
  * @file hybrid_cpu.c
- * @brief Contains the MPI + OpenMP version of Laplace.
+ * @brief Contains the MPI version of Laplace.
  * @note This code was originaly written by John Urbanic for PSC 2014, later modified by Ludovic Capelli.
  * @author John Urbanic
  * @author Ludovic Capelli
@@ -35,11 +35,17 @@ int main(int argc, char *argv[])
     // The rank of my MPI process
     int my_rank;
     // Status returned by MPI calls
-    MPI_Status status;
+    MPI_Status status[2];
+    
+    // Request returned by MPI calls
+    MPI_Request request[2] = MPI_REQUEST_NULL;
 
+    MPI_Datatype column;
     // The usual MPI startup routines
 	int provided;
 	MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+        MPI_Type_contiguous(COLUMNS, MPI_DOUBLE, &column);
+        MPI_Type_commit(&column);
 	if(provided < MPI_THREAD_FUNNELED)
     {
         printf("The threading support level is lesser than that demanded.\n");
@@ -80,7 +86,7 @@ int main(int argc, char *argv[])
         iteration++;
 
         // Main calculation: average my four neighbours
-		#pragma omp parallel for
+	#pragma omp parallel for
         for(unsigned int i = 1; i <= ROWS; i++)
         {
             for(unsigned int j = 1; j <= COLUMNS; j++)
@@ -100,36 +106,40 @@ int main(int argc, char *argv[])
         if(my_rank != comm_size-1)
         {
 			// We send our bottom row to our bottom neighbour
-            MPI_Send(&temperature[ROWS][1], COLUMNS, MPI_DOUBLE, my_rank+1, 0, MPI_COMM_WORLD);
+	    //MPI_Sendrecv(&temperature[ROWS][1], COLUMNS, MPI_DOUBLE, my_rank+1, 0, &temperature_last[0][1], COLUMNS, MPI_DOUBLE, my_rank, 0, MPI_COMM_WORLD, &status[0]);
+            MPI_Isend(&temperature[ROWS][1], 1, column, my_rank+1, my_rank, MPI_COMM_WORLD, &request[0]);
         }
 
         // If we are not the first MPI process, we have a top neighbour
         if(my_rank != 0)
         {
             // We receive the bottom row from that neighbour into our top halo
-            MPI_Recv(&temperature_last[0][1], COLUMNS, MPI_DOUBLE, my_rank-1, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+            MPI_Irecv(&temperature_last[0][1], 1, column, my_rank-1, my_rank-1, MPI_COMM_WORLD, &request[0]);
         }
 
         // If we are not the first MPI process, we have a top neighbour
         if(my_rank != 0)
         {
             // Send out top row to our top neighbour
-            MPI_Send(&temperature[1][1], COLUMNS, MPI_DOUBLE, my_rank-1, 0, MPI_COMM_WORLD);
+            MPI_Isend(&temperature[1][1], 1, column, my_rank-1, my_rank, MPI_COMM_WORLD, &request[1]);
+            //MPI_Sendrecv(&temperature[1][1], COLUMNS, MPI_DOUBLE, my_rank-1, my_rank, &temperature_last[ROWS+1][1], COLUMNS, MPI_DOUBLE, my_rank, my_rank, MPI_COMM_WORLD, &status[0]);
         }
 
         // If we are not the last MPI process, we have a bottom neighbour
         if(my_rank != comm_size-1)
         {   
             // We receive the top row from that neighbour into our bottom halo
-            MPI_Recv(&temperature_last[ROWS+1][1], COLUMNS, MPI_DOUBLE, my_rank+1, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+            MPI_Irecv(&temperature_last[ROWS+1][1], 1, column, my_rank+1, my_rank+1, MPI_COMM_WORLD, &request[1]);
         }
+
+        MPI_Waitall(2, request, status);
 
         //////////////////////////////////////
         // FIND MAXIMAL TEMPERATURE CHANGE //
         ////////////////////////////////////
         dt = 0.0;
 
-		#pragma omp parallel for reduction(max:dt)
+	#pragma omp parallel for reduction(max:dt)
         for(unsigned int i = 1; i <= ROWS; i++)
         {
             for(unsigned int j = 1; j <= COLUMNS; j++)
@@ -140,9 +150,9 @@ int main(int argc, char *argv[])
         }
 
         // We know our temperature delta, we now need to sum it with that of other MPI processes
-        MPI_Reduce(&dt, &dt_global, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&dt_global, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
+        //MPI_Reduce(&dt, &dt_global, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        //MPI_Bcast(&dt_global, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Iallreduce(&dt, &dt_global, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD, &request[1]);
         // Periodically print test values
         if((iteration % PRINT_FREQUENCY) == 0)
         {
@@ -151,6 +161,7 @@ int main(int argc, char *argv[])
                 track_progress(iteration, temperature);
     	    }
         }
+        MPI_Wait(&request[1], &status[1]);
     }
 
     // Slightly more accurate timing and cleaner output 
@@ -171,6 +182,5 @@ int main(int argc, char *argv[])
 	{
 		printf("Value of halo swap verification cell [%d][%d] is %.18f\n", ROWS_GLOBAL - ROWS - 1, COLUMNS - 1, temperature[ROWS][COLUMNS]);
 	}
-
     MPI_Finalize();
 }
